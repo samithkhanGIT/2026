@@ -382,6 +382,7 @@
     .combo-item:hover{ background: rgba(96,165,250,.14); }
     .combo-empty{ padding: 10px 10px; font-size: 12px; color: var(--muted); }
 
+    /* Mobile combo panel (full-width bottom sheet) */
     @media (max-width: 520px){
       .wrap{ padding: 12px; }
       .modal{ width:100%; border-radius:16px; }
@@ -393,7 +394,7 @@
         top: auto;
         max-height: min(55vh, 420px);
         border-radius: 16px;
-        z-index: 9999;
+        z-index: 9999;  /* ensure above modal content */
       }
     }
   </style>
@@ -548,16 +549,24 @@
   <div class="toast" id="toast"></div>
 
 <script>
-  // ============================
+  // ==========================================================
   // 0) SUPABASE CONFIG (EDIT THIS)
-  // ============================
-  const SUPABASE_URL = "https://wvwspztbkpiowtwadhrh.supabase.co";
-  const SUPABASE_ANON_KEY = "sb_publishable_WnYuIUQUk168lgRKyCPOTQ_baEFCdfx";
-  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  // ==========================================================
+  // IMPORTANT:
+  // - Do NOT use service_role / secret key in frontend
+  // - Prefer "anon public" key (JWT-like starting with eyJ...)
+  const SUPABASE_URL = "https://bioyrzoguuaccdvzauhp.supabase.co";
+  const SUPABASE_PUBLIC_KEY = "sb_publishable_bNgSfTtK61rwzmF_9C_9aA_VwQvxv6I";
 
-  // ============================
+  // Guard: if CDN blocked, we still render UI (offline mode)
+  const SUPABASE_LIB_OK = typeof window.supabase !== "undefined" && typeof window.supabase.createClient === "function";
+
+  // Create client as `sb` (do NOT shadow global `supabase`)
+  const sb = SUPABASE_LIB_OK ? window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLIC_KEY) : null;
+
+  // ==========================================================
   // 1) DATA
-  // ============================
+  // ==========================================================
   const MODULES = [
     "ECOLOGY FOR SPATIAL PLANNING",
     "STATISTICAL AND QUANTITATIVE IN PLANNING",
@@ -613,9 +622,9 @@
     "1.15pm – 4.30pm"
   ];
 
-  // ============================
+  // ==========================================================
   // 2) RULES / RANGE
-  // ============================
+  // ==========================================================
   const SELECT_START = new Date(2026, 1, 10); // Feb 10 2026
   const SELECT_END   = new Date(2026, 2, 7);  // Mar 7 2026
   const ALLOWED_DOW  = new Set([2,3,4,5,6]);  // Tue–Sat
@@ -625,9 +634,9 @@
     {year:2026, month:2, name:"March 2026"}
   ];
 
-  // ============================
+  // ==========================================================
   // 3) STATE
-  // ============================
+  // ==========================================================
   const $ = (id) => document.getElementById(id);
 
   let selectedDateISO = null;
@@ -635,18 +644,17 @@
   let adminMode = false;
   const ADMIN_PIN = "TCP2026";
 
-  // Cached reservations (from DB) for instant rendering:
   // key = `${dateISO}__${slot}` -> reservation object
   const reservationsMap = new Map();
 
-  // ============================
+  // ==========================================================
   // 4) HELPERS
-  // ============================
+  // ==========================================================
   function toast(msg){
     const t = $("toast");
     t.textContent = msg;
     t.classList.add("show");
-    setTimeout(()=>t.classList.remove("show"), 1800);
+    setTimeout(()=>t.classList.remove("show"), 2000);
   }
 
   function iso(d){
@@ -715,22 +723,34 @@
       .replaceAll("'","&#039;");
   }
 
-  // ============================
+  function safeIdForQuerySelector(dateISO){
+    // Avoid CSS.escape compatibility issues in older browsers
+    return `slots-${dateISO.replaceAll("-", "_")}`;
+  }
+
+  // ==========================================================
   // 5) DB: LOAD + REALTIME
-  // ============================
+  // ==========================================================
   async function loadReservationsFromDB(){
+    if(!sb){
+      // Offline mode (still render UI)
+      reservationsMap.clear();
+      return;
+    }
+
     const dates = buildSelectableDates();
-    // Fetch only reservations within date range (text compare is ok here because YYYY-MM-DD)
-    const { data, error } = await supabase
+    const minISO = dates[0];
+    const maxISO = dates[dates.length - 1];
+
+    const { data, error } = await sb
       .from("reservations")
       .select("*")
-      .gte("date_iso", dates[0])
-      .lte("date_iso", dates[dates.length - 1]);
+      .gte("date_iso", minISO)
+      .lte("date_iso", maxISO);
 
     if(error){
-      console.error(error);
-      toast("Error loading reservations.");
-      return;
+      console.error("Supabase load error:", error);
+      throw error;
     }
 
     reservationsMap.clear();
@@ -740,36 +760,44 @@
   }
 
   function startRealtime(){
-    supabase
+    if(!sb) return;
+
+    sb
       .channel("tcp-reservations")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "reservations" },
         (payload) => {
-          // Keep local cache in sync
-          if(payload.eventType === "INSERT"){
-            const r = payload.new;
-            reservationsMap.set(keyOf(r.date_iso, r.slot), r);
-          }
-          if(payload.eventType === "DELETE"){
-            const r = payload.old;
-            reservationsMap.delete(keyOf(r.date_iso, r.slot));
-          }
-          if(payload.eventType === "UPDATE"){
-            const r = payload.new;
-            reservationsMap.set(keyOf(r.date_iso, r.slot), r);
-          }
+          try{
+            if(payload.eventType === "INSERT"){
+              const r = payload.new;
+              reservationsMap.set(keyOf(r.date_iso, r.slot), r);
+            }
+            if(payload.eventType === "DELETE"){
+              const r = payload.old;
+              reservationsMap.delete(keyOf(r.date_iso, r.slot));
+            }
+            if(payload.eventType === "UPDATE"){
+              const r = payload.new;
+              reservationsMap.set(keyOf(r.date_iso, r.slot), r);
+            }
 
-          buildCalendar();
-          buildSchedule();
+            buildCalendar();
+            buildSchedule();
+          } catch(e){
+            console.error("Realtime handler error:", e);
+          }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        // optional debug
+        // console.log("Realtime status:", status);
+      });
   }
 
-  // ============================
+  // ==========================================================
   // 6) ADMIN
-  // ============================
+  // ==========================================================
   function adminToggle(){
     if(!adminMode){
       const pin = prompt("Admin PIN:");
@@ -801,8 +829,12 @@
     );
     if(!ok) return;
 
-    // NOTE: This requires delete policy enabled (see SQL).
-    const { error } = await supabase
+    if(!sb){
+      alert("Supabase not connected (offline).");
+      return;
+    }
+
+    const { error } = await sb
       .from("reservations")
       .delete()
       .eq("id", res.id);
@@ -814,13 +846,12 @@
     }
 
     toast("Reservation removed.");
-    // Realtime will auto-refresh UI, but keep safe:
     await refreshUI();
   }
 
-  // ============================
+  // ==========================================================
   // 7) RENDER CALENDAR + SCHEDULE
-  // ============================
+  // ==========================================================
   function buildCalendar(){
     const monthsWrap = $("months");
     monthsWrap.innerHTML = "";
@@ -877,6 +908,7 @@
           cell.addEventListener("click", ()=>{
             selectedDateISO = dateISO;
             buildCalendar();
+
             const el = document.querySelector(`[data-date="${dateISO}"]`);
             if(el) el.scrollIntoView({behavior:"smooth", block:"start"});
             toast(`Selected: ${prettyFromISO(dateISO)}`);
@@ -902,7 +934,11 @@
     const dates = buildSelectableDates();
     const totalSlots = dates.length * TIME_SLOTS.length;
     const reservedCount = reservationsMap.size;
-    $("summaryPill").textContent = `Reserved: ${reservedCount}/${totalSlots}`;
+
+    // If no sb: still show UI (offline)
+    $("summaryPill").textContent = sb
+      ? `Reserved: ${reservedCount}/${totalSlots}`
+      : `Offline mode (no DB)`;
 
     for(const dateISO of dates){
       const st = dayStatus(dateISO);
@@ -918,17 +954,19 @@
         st === "yellow" ? `Partially booked (${booked}/3 booked)` :
         `Fully booked (3/3 booked)`;
 
+      const slotsId = safeIdForQuerySelector(dateISO);
+
       block.innerHTML = `
         <div class="datehead">
           <div class="dtitle">📌 ${escapeHtml(prettyFromISO(dateISO))}</div>
           <div class="badge ${badgeClass}">${escapeHtml(badgeText)}</div>
         </div>
-        <div class="slots" id="slots-${dateISO}"></div>
+        <div class="slots" id="${slotsId}"></div>
       `;
 
       schedule.appendChild(block);
 
-      const slotsWrap = block.querySelector(`#slots-${CSS.escape(dateISO)}`);
+      const slotsWrap = document.getElementById(slotsId);
 
       for(const slot of TIME_SLOTS){
         const res = getReservation(dateISO, slot);
@@ -972,13 +1010,18 @@
     }
   }
 
-  // ============================
+  // ==========================================================
   // 8) RESERVE (DB INSERT with global lock)
-  // ============================
+  // ==========================================================
   function openReserve(dateISO, slot){
     const exists = getReservation(dateISO, slot);
     if(exists){
       toast(`Already reserved by ${exists.lecturer}`);
+      return;
+    }
+
+    if(!sb){
+      alert("Supabase not connected (offline).");
       return;
     }
 
@@ -1020,8 +1063,13 @@
       return;
     }
 
-    // Try insert. Unique index will reject if someone already took it.
-    const { data, error } = await supabase
+    if(!sb){
+      alert("Supabase not connected (offline).");
+      return;
+    }
+
+    // Try insert. UNIQUE(date_iso, slot) should block duplicates.
+    const { data, error } = await sb
       .from("reservations")
       .insert([{
         date_iso: dateISO,
@@ -1035,15 +1083,13 @@
       .single();
 
     if(error){
-      // Most common: duplicate (slot already reserved)
-      console.error(error);
-      alert("This slot was already reserved by someone else. Please choose another slot.");
+      console.error("Insert error:", error);
+      alert("This slot was already reserved (or RLS blocked). Please choose another slot.");
       await refreshUI();
       closeReserve();
       return;
     }
 
-    // Update local cache immediately (realtime will also do it)
     reservationsMap.set(keyOf(data.date_iso, data.slot), data);
 
     closeReserve();
@@ -1053,14 +1099,19 @@
   }
 
   async function refreshUI(){
-    await loadReservationsFromDB();
+    try{
+      await loadReservationsFromDB();
+    } catch(e){
+      // Keep UI running even if DB fails
+      console.error("RefreshUI DB error:", e);
+    }
     buildCalendar();
     buildSchedule();
   }
 
-  // ============================
+  // ==========================================================
   // 9) EXPORT (from cache)
-  // ============================
+  // ==========================================================
   function csvEscape(v){
     const s = String(v ?? "");
     if(/[",\n]/.test(s)) return `"${s.replaceAll('"','""')}"`;
@@ -1094,7 +1145,7 @@
           res ? res.module : "",
           res ? res.instructor : "",
           res ? res.venue : "",
-          res ? res.submitted_at : ""
+          res ? (res.submitted_at || res.created_at || "") : ""
         ].map(csvEscape).join(","));
       }
     }
@@ -1109,9 +1160,9 @@
     toast("JSON exported.");
   }
 
-  // ============================
+  // ==========================================================
   // 10) COMBO DROPDOWNS
-  // ============================
+  // ==========================================================
   const COMBOS = {
     lecturer: { inputId: "lecturerInput", panelId: "lecturerPanel", items: LECTURERS },
     module: { inputId: "moduleInput", panelId: "modulePanel", items: MODULES },
@@ -1171,6 +1222,7 @@
     const btn = wrapper.querySelector(".combo-btn");
 
     input.addEventListener("focus", ()=> openComboPanel(key));
+    input.addEventListener("click", ()=> openComboPanel(key)); // helps mobile
     input.addEventListener("input", ()=>{
       const panel = $(cfg.panelId);
       if(!panel.classList.contains("show")) panel.classList.add("show");
@@ -1191,9 +1243,9 @@
     if(!e.target.closest(".combo")) closeAllComboPanels();
   });
 
-  // ============================
+  // ==========================================================
   // 11) INIT
-  // ============================
+  // ==========================================================
   async function init(){
     selectedDateISO = iso(SELECT_START);
 
@@ -1218,12 +1270,34 @@
       }
     });
 
-    await loadReservationsFromDB();
+    // Always render UI first (even if DB fails)
     buildCalendar();
     buildSchedule();
-    startRealtime();
 
-    toast("Loaded reservations (shared).");
+    // Supabase check + load
+    if(!SUPABASE_LIB_OK){
+      $("summaryPill").textContent = "Supabase CDN blocked";
+      toast("Supabase library not loaded. Check Brave shields / script blocking.");
+      return;
+    }
+
+    try{
+      await loadReservationsFromDB();
+      buildCalendar();
+      buildSchedule();
+      startRealtime();
+      toast("Loaded reservations (shared).");
+    } catch(e){
+      // Keep UI running + show clear message
+      $("summaryPill").textContent = "DB error (check RLS / key)";
+      console.error("Init DB error:", e);
+
+      const msg =
+        (e && e.message) ? e.message :
+        "Could not load from Supabase. Check RLS policies + table columns + key type (anon/public).";
+
+      toast("Supabase error: " + msg);
+    }
   }
 
   init();
